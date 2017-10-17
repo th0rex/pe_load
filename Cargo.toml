@@ -1,0 +1,8 @@
+[package]
+name = "pe_load"
+version = "0.1.0"
+authors = ["th0rex"]
+
+[dependencies]
+kernel32-sys = "0.2.2"
+winapi = "0.2.8"
