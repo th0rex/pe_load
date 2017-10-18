@@ -3,6 +3,7 @@
 extern crate kernel32;
 extern crate winapi;
 
+pub(crate) mod rva;
 mod structs;
 
 use std::borrow::Borrow;
@@ -166,9 +167,9 @@ impl<T: AsRef<[u8]>> Loader<T> {
         let size = file_header
             .get_sections()
             .iter()
-            .filter(|&s| s.virtual_address != 0)
-            .max_by_key(|&s| s.virtual_address + s.size_of_raw_data)
-            .map(|x| x.virtual_address + x.size_of_raw_data)
+            .filter(|&s| s.virtual_address.value != 0)
+            .map(|x| x.virtual_address.value + x.size_of_raw_data)
+            .max()
             .unwrap();
         let page_size = unsafe { get_native_page_size() } - 1;
         let size = (size + page_size) & !page_size;
@@ -187,9 +188,9 @@ impl<T: AsRef<[u8]>> Loader<T> {
         for section in file_header
             .get_sections()
             .iter()
-            .filter(|&s| s.virtual_address != 0)
+            .filter(|&s| s.virtual_address.value != 0)
         {
-            let p = resolve(&base, section.virtual_address as _);
+            let p = section.virtual_address.resolve(base.raw as _).p;
             if section.size_of_raw_data == 0 {
                 // ???
                 unsafe {
@@ -216,118 +217,73 @@ impl<T: AsRef<[u8]>> Loader<T> {
     fn relocate(&mut self) -> Result<(), LoadError> {
         let dos_header = self.get_dos_header();
         let optional_header = &dos_header.get_pe_header().optional_header;
-        let relocations = &optional_header.get_data_entries()[DirectoryEntry::Basereloc as usize];
 
         // We don't need to relocate if we managed to load the image at the preferred base address.
         if self.image_base == optional_header.image_base {
             return Ok(());
         }
 
-        //let base_relocation = unsafe {
-        //&*(self.pe_buffer.as_ref().as_ptr().offset(relocations.virtual_address as _)
-        // as *const ImageBaseRelocation) };
-        let base_relocation = unsafe {
-            &*(resolve_raw(self.image_base, relocations.virtual_address as _)
-                as *const ImageBaseRelocation)
-        };
+        match optional_header.get_relocation_entries(self.image_base) {
+            None => Ok(()),
+            Some(base_relocation) => {
+                let delta = self.image_base - optional_header.image_base;
 
-        if base_relocation.size_of_block as usize <= std::mem::size_of::<ImageBaseRelocation>() {
-            return Ok(());
-        }
+                for base_reloc in base_relocation.base_relocations() {
+                    for (relocation_type, offset) in base_reloc.relocations() {
+                        let mut address = base_reloc
+                            .virtual_address
+                            .resolve(self.image_base + offset as u64);
 
-        //println!("base: {} preffered: {}", self.image_base, optional_header.image_base);
-        //let delta = self.image_base - optional_header.image_base;
-        //let delta = self.image_base.wrapping_sub(optional_header.image_base);
-       /* let delta = if self.image_base >= optional_header.image_base {
-            (self.image_base - optional_header.image_base) as i64
-        } else {
-            -((optional_header.image_base - self.image_base) as i64)
-        };*/
-        let delta = self.image_base - optional_header.image_base;
-
-        for base_reloc in base_relocation.base_relocations() {
-            for (relocation_type, offset) in base_reloc.relocations() {
-                // TODO: This needs to be a u32 if we are loading a 32 bit Pe image
-                let address = unsafe {
-                    &mut *((self.image_base as *mut c_char)
-                        .offset(base_reloc.virtual_address as _)
-                        .offset(offset as _) as *mut u64)
-                };
-
-                if relocation_type == RelocateAbsolute {
-                    // TODO what to even do lul ?
-                } else if relocation_type == RelocateDir64 {
-                    *address += delta;
-                } else if relocation_type == RelocateHighLow {
-                    *address += delta & u32::max_value() as u64;
-                } else {
-                    return Err(LoadError::UnsupporrtedRelocationType(relocation_type));
+                        if relocation_type == RelocateAbsolute {
+                            // TODO what to even do lul ?
+                            //return Err(LoadError::UnsupporrtedRelocationType(relocation_type));
+                        } else if relocation_type == RelocateDir64 {
+                            *address += delta;
+                        } else if relocation_type == RelocateHighLow {
+                            *address += delta & u32::max_value() as u64;
+                        } else {
+                            return Err(LoadError::UnsupporrtedRelocationType(relocation_type));
+                        }
+                    }
                 }
+
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     fn resolve_imports(&mut self) -> Result<(), LoadError> {
         let dos_header = self.get_dos_header();
         let optional_header = &dos_header.get_pe_header().optional_header;
-        let import_entry = &optional_header.get_data_entries()[DirectoryEntry::Import as usize];
 
-        if import_entry.virtual_address == 0 || import_entry.size == 0 {
-            return Ok(());
-        }
+        match optional_header.get_import_descriptor(self.image_base) {
+            None => Ok(()),
+            Some(import_descriptor) => {
+                for import_descriptor in import_descriptor.import_iterator() {
+                    let dll_name = import_descriptor.name.resolve(self.image_base);
+                    let hmod = unsafe { LoadLibraryA(dll_name.p) };
 
-        let mut image_import_descriptor = unsafe {
-            ((self.image_base as *const c_char).offset(import_entry.virtual_address as _)
-                as *const ImportDescriptor)
-        };
-        unsafe {
-            while (*image_import_descriptor).name != 0 {
-                let dll_name =
-                    (self.image_base as *const c_char).offset((*image_import_descriptor).name as _);
-                let hmod = LoadLibraryA(dll_name);
-
-                if hmod.is_null() {
-                    return Err(LoadError::LoadLibraryFailed);
-                }
-
-                // let original_thunk = if (*image_import_descriptor).original
-                let mut original_thunk = unsafe {
-                    ((self.image_base as *mut c_char)
-                        .offset((*image_import_descriptor).first_thunk as _)
-                        as *mut ThunkData)
-                };
-
-                while (*original_thunk).address_of_data != 0 {
-                    let function = if image_snap_by_ordinal((*original_thunk).ordinal) {
-                        unsafe {
-                            GetProcAddress(
-                                hmod,
-                                image_ordinal((*original_thunk).ordinal) as *const c_char,
-                            )
-                        }
-                    } else {
-                        let name = unsafe {
-                            ((self.image_base as *const c_char)
-                                .offset((*original_thunk).address_of_data as _)
-                                as *const ImageImportByName)
-                        };
-                        unsafe { GetProcAddress(hmod, &(*name).name as *const c_char) }
-                    };
-
-                    unsafe {
-                        (*original_thunk).function = function as u64;
+                    if hmod.is_null() {
+                        return Err(LoadError::LoadLibraryFailed);
                     }
 
-                    original_thunk = original_thunk.offset(1);
+                    for thunk in import_descriptor.thunk_iterator(self.image_base) {
+                        let function = if image_snap_by_ordinal(unsafe { thunk.ordinal }) {
+                            unsafe {
+                                GetProcAddress(hmod, image_ordinal(thunk.ordinal) as *const c_char)
+                            }
+                        } else {
+                            let name = unsafe { thunk.address_of_data }.resolve(self.image_base);
+                            unsafe { GetProcAddress(hmod, &name.name as *const c_char) }
+                        };
+
+                        thunk.function = function as u64;
+                    }
                 }
 
-                image_import_descriptor = image_import_descriptor.offset(1);
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     fn mem_protect(&mut self) -> Result<(), LoadError> {
@@ -338,9 +294,9 @@ impl<T: AsRef<[u8]>> Loader<T> {
         for section in file_header
             .get_sections()
             .iter()
-            .filter(|&s| s.virtual_address != 0 && s.size_of_raw_data != 0)
+            .filter(|&s| s.virtual_address.value != 0 && s.size_of_raw_data != 0)
         {
-            let section_base = resolve_raw(self.image_base, section.virtual_address as _);
+            let section_base = resolve_raw(self.image_base, section.virtual_address.value as _);
             let characteristics = section.characteristics as u32;
 
             let flags = match (
@@ -378,22 +334,24 @@ impl<T: AsRef<[u8]>> Loader<T> {
         let dos_header = self.get_dos_header();
         let optional_header = &dos_header.get_pe_header().optional_header;
 
-        let entry = &optional_header.get_data_entries()[DirectoryEntry::Tls as usize];
-        if entry.virtual_address == 0 {
-            return Ok(());
-        }
+        match optional_header.get_tls_entries(self.image_base) {
+            None => Ok(()),
+            Some(entry) => {
+                let mut callback = entry.address_of_callbacks as *const TlsCallback;
 
-        let directory_entry = unsafe { &*(resolve_raw(self.image_base, entry.virtual_address as _) as *const TlsDirectory) };
-        let mut callback = directory_entry.address_of_callbacks as *const TlsCallback;
+                if !callback.is_null() {
+                    while let &Some(f) = unsafe { &*callback } {
+                        f(
+                            self.image_base as *mut _,
+                            DLL_PROCESS_ATTACH,
+                            ptr::null_mut(),
+                        );
+                        callback = unsafe { callback.offset(1) };
+                    }
+                }
 
-        if !callback.is_null() {
-            while let &Some(f) = unsafe { &*callback } {
-                f(self.image_base as *mut _, DLL_PROCESS_ATTACH, ptr::null_mut());
-                callback = unsafe { callback.offset(1) };
+                Ok(())
             }
         }
-
-
-        Ok(())
     }
 }

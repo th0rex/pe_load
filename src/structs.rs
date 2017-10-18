@@ -1,11 +1,10 @@
 
-#![allow(dead_code)]
-
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::os::raw::{c_char, c_void};
 use std::slice;
 
-// 64 bit only for now lol
+use super::rva::{Pointer, RVA};
 
 #[repr(u16)]
 pub enum Machine {
@@ -113,7 +112,7 @@ pub union MiscUnion {
 pub struct ImageSectionHeader {
     pub name: [c_char; 8],
     pub misc: MiscUnion,
-    pub virtual_address: u32,
+    pub(crate) virtual_address: RVA<u32, Pointer<*mut u8>>,
     pub size_of_raw_data: u32,
     pub p_raw_data: u32,
     pub p_reloc: u32,
@@ -123,9 +122,10 @@ pub struct ImageSectionHeader {
     pub characteristics: Characteristics,
 }
 
+// TODO: Template to pointer size of the pe file being loaded
 #[repr(C)]
 pub struct ImageBaseRelocation {
-    pub virtual_address: u32,
+    pub(crate) virtual_address: RVA<u32, Pointer<*mut u64>>,
     pub size_of_block: u32,
 }
 
@@ -144,7 +144,10 @@ impl ImageBaseRelocation {
         let next_base_relocation =
             unsafe { &*(relocations_start.offset(count as _) as *const ImageBaseRelocation) };
 
-        if next_base_relocation.virtual_address == 0 && next_base_relocation.size_of_block == 0 {
+        // TODO: Is there a better condition to check?
+        if next_base_relocation.virtual_address.value == 0
+            && next_base_relocation.size_of_block == 0
+        {
             None
         } else {
             Some(next_base_relocation)
@@ -212,13 +215,83 @@ impl Iterator for RelocationIterator {
     }
 }
 
+pub(crate) struct ThunkIterator<'a> {
+    current: Pointer<*mut ThunkData>,
+    _p: PhantomData<&'a u32>,
+}
+
+impl<'a> ThunkIterator<'a> {
+    fn new(c: &'a ImportDescriptor, base: u64) -> Self {
+        Self {
+            current: c.first_thunk.resolve(base),
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<'a> Iterator for ThunkIterator<'a> {
+    type Item = &'a mut ThunkData;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if unsafe { self.current.address_of_data.value } != 0 {
+            let current = self.current.p;
+            self.current = Pointer {
+                p: unsafe { current.offset(1) },
+            };
+            Some(unsafe { &mut *current })
+        } else {
+            None
+        }
+    }
+}
+
 #[repr(C)]
 pub struct ImportDescriptor {
     pub imports_by_name: u32,
     pub time_stamp: u32,
     pub forwarder_chain: u32,
-    pub name: u32,
-    pub first_thunk: u32,
+    pub(crate) name: RVA<u32, Pointer<*const c_char>>,
+    pub(crate) first_thunk: RVA<u32, Pointer<*mut ThunkData>>,
+}
+
+impl ImportDescriptor {
+    pub(crate) fn thunk_iterator<'a>(&'a self, base: u64) -> ThunkIterator<'a> {
+        ThunkIterator::new(self, base)
+    }
+
+    pub(crate) fn import_iterator<'a>(&'a self) -> ImportIterator<'a> {
+        ImportIterator::new(self)
+    }
+}
+
+pub(crate) struct ImportIterator<'a> {
+    p: *const ImportDescriptor,
+    _p: PhantomData<&'a ImportDescriptor>,
+}
+
+impl<'a> ImportIterator<'a> {
+    fn new(i: &'a ImportDescriptor) -> Self {
+        Self {
+            p: i as *const _,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<'a> Iterator for ImportIterator<'a> {
+    type Item = &'a ImportDescriptor;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            if (*self.p).name.value == 0 {
+                None
+            } else {
+                let item = &(*self.p);
+                self.p = self.p.offset(1);
+                Some(item)
+            }
+        }
+    }
 }
 
 pub fn image_snap_by_ordinal(ordinal: u64) -> bool {
@@ -235,7 +308,7 @@ pub union ThunkData {
     pub forwarder_string: u64,
     pub function: u64,
     pub ordinal: u64,
-    pub address_of_data: u64,
+    pub(crate) address_of_data: RVA<u64, Pointer<*const ImageImportByName>>,
 }
 
 #[repr(C)]
@@ -255,9 +328,11 @@ pub struct ImageImportByName {
     pub name: c_char,
 }
 
+// TODO: Template this so we can resolve it to the correct types
+// and then provide getter functions in the optional header
 #[repr(C)]
-pub struct DataEntry {
-    pub virtual_address: u32,
+pub struct DataEntry<T> {
+    pub(crate) virtual_address: RVA<u32, Pointer<*mut T>>,
     pub size: u32,
 }
 
@@ -296,7 +371,56 @@ pub struct OptionalHeader {
 }
 
 impl OptionalHeader {
-    pub fn get_data_entries(&self) -> &[DataEntry] {
+    fn data_entries_start(&self) -> *const u8 {
+        unsafe { (self as *const _ as *const u8).offset(size_of::<OptionalHeader>() as _) }
+    }
+
+    fn data_entry<T>(&self, e: DirectoryEntry) -> &DataEntry<T> {
+        unsafe {
+            let ptr = (self.data_entries_start() as *const DataEntry<T>).offset(e as _);
+            &*ptr
+        }
+    }
+
+    pub(crate) fn get_import_descriptor(
+        &self,
+        base: u64,
+    ) -> Option<Pointer<*const ImportDescriptor>> {
+        let entry = self.data_entry::<ImportDescriptor>(DirectoryEntry::Import);
+        if entry.virtual_address.value == 0 || entry.size == 0 {
+            None
+        } else {
+            Some(entry.virtual_address.resolve(base).into())
+        }
+    }
+
+    pub(crate) fn get_relocation_entries(
+        &self,
+        base: u64,
+    ) -> Option<Pointer<*mut ImageBaseRelocation>> {
+        let entry = self.data_entry::<ImageBaseRelocation>(DirectoryEntry::Basereloc);
+        if entry.virtual_address.value == 0 {
+            None
+        } else {
+            let reloc = entry.virtual_address.resolve(base);
+            if reloc.size_of_block as usize <= size_of::<ImageBaseRelocation>() {
+                None
+            } else {
+                Some(reloc)
+            }
+        }
+    }
+
+    pub(crate) fn get_tls_entries(&self, base: u64) -> Option<Pointer<*const TlsDirectory>> {
+        let entry = self.data_entry::<TlsDirectory>(DirectoryEntry::Tls);
+        if entry.virtual_address.value == 0 {
+            None
+        } else {
+            Some(entry.virtual_address.resolve(base).into())
+        }
+    }
+
+    /*pub fn get_data_entries(&self) -> &[DataEntry] {
         unsafe {
             let self_ptr = self as *const _ as *const c_char;
             slice::from_raw_parts(
@@ -304,7 +428,7 @@ impl OptionalHeader {
                 self.num_of_rva_and_sizes as _,
             )
         }
-    }
+    }*/
 }
 
 #[repr(C)]
